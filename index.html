@@ -844,6 +844,25 @@ const FIREBASE_CONFIG = {
   projectId: ""
 };
 
+/* ============================================================================
+   پیکربندی حافظه آنلاین مشترک (jsonbin.io) - توصیه‌شده و ساده‌تر از Firebase
+   ----------------------------------------------------------------------------
+   این سرویس مخصوص همین کار (ذخیره JSON از داخل مرورگر) ساخته شده و نیازی به
+   کنسول گوگل ندارد. مراحل (همه از گوشی هم قابل انجام است):
+   ۱) به آدرس https://jsonbin.io بروید و یک حساب رایگان بسازید (ایمیل/رمز).
+   ۲) بعد از ورود، از داشبورد روی "Create Bin" بزنید، داخل کادر فقط بنویسید: {}
+      و بعد "Create" را بزنید.
+   ۳) بالای صفحه بین، یک شناسه (Bin ID) می‌بینید - آن را کپی کنید.
+   ۴) از منوی حساب کاربری (گوشه بالا) وارد "API Keys" شوید و مقدار
+      "X-Master-Key" را کپی کنید.
+   ۵) دو مقدار زیر را با همان‌ها جایگزین کنید. تا وقتی خالی باشند، برنامه از
+      روش‌های دیگر (kvdb.io یا حافظه محلی) استفاده می‌کند.
+   ============================================================================ */
+const JSONBIN_CONFIG = {
+  binId: "6a5036e9f5f4af5e297a2278",
+  masterKey: "$2a$10$.xzVlB4eUMMMIjYa9RYTwOgLWSZ5.Z7Z/8va4.3bQMYVLpYA5DPi6"
+};
+
 const CATEGORIES = [
   { key: 'pump', label: 'پمپ' },
   { key: 'compressor', label: 'کمپرسور' },
@@ -978,10 +997,10 @@ function showChartFallback(canvasId) {
 /* ---------- storage layer ----------
    Priority:
    1) Firebase Realtime Database - only if FIREBASE_CONFIG is filled in (needs a Google account/console access)
-   2) kvdb.io - a free, no-signup, non-Google key/value store used as the DEFAULT shared backend
-      so multiple users on multiple devices/browsers see the same live data automatically.
-   3) Claude artifact cloud storage (shared only inside Claude preview)
-   4) browser localStorage (this browser/device only) - final safety net */
+   2) jsonbin.io - recommended default: built specifically for browser apps, reliable CORS support
+   3) kvdb.io - free, no-signup fallback key/value store (used only if jsonbin isn't configured/reachable)
+   4) Claude artifact cloud storage (shared only inside Claude preview)
+   5) browser localStorage (this browser/device only) - final safety net */
 let firebaseDB = null;
 function initFirebase() {
   if (!FIREBASE_CONFIG.apiKey || !FIREBASE_CONFIG.databaseURL) return false;
@@ -996,17 +1015,56 @@ const HAS_FIREBASE = initFirebase();
 const HAS_CLOUD_STORAGE = (typeof window.storage !== 'undefined' && window.storage && typeof window.storage.get === 'function' && typeof window.storage.set === 'function');
 let ACTIVE_MODE = HAS_FIREBASE ? 'firebase' : 'local';
 
+function fetchWithTimeout(url, opts, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms || 6000);
+  return fetch(url, Object.assign({}, opts, { signal: controller.signal })).finally(() => clearTimeout(timer));
+}
+
+/* jsonbin.io - one JSON document holding all app keys together */
+const JSONBIN_URL = 'https://api.jsonbin.io/v3/b/' + JSONBIN_CONFIG.binId;
+let jsonbinCache = null;
+let jsonbinUnavailable = !(JSONBIN_CONFIG.binId && JSONBIN_CONFIG.masterKey);
+async function jsonbinEnsureCache() {
+  if (jsonbinCache) return true;
+  if (jsonbinUnavailable) return false;
+  try {
+    const res = await fetchWithTimeout(JSONBIN_URL + '/latest', { headers: { 'X-Master-Key': JSONBIN_CONFIG.masterKey } }, 8000);
+    if (!res.ok) throw new Error('bad status ' + res.status);
+    const data = await res.json();
+    jsonbinCache = (data && data.record && typeof data.record === 'object') ? data.record : {};
+    ACTIVE_MODE = 'jsonbin';
+    return true;
+  } catch (e) { jsonbinUnavailable = true; return false; }
+}
+async function jsonbinGet(key) {
+  const ok = await jsonbinEnsureCache();
+  if (!ok) return undefined;
+  return Object.prototype.hasOwnProperty.call(jsonbinCache, key) ? jsonbinCache[key] : null;
+}
+async function jsonbinSet(key, value) {
+  const ok = await jsonbinEnsureCache();
+  if (!ok) return false;
+  const prev = jsonbinCache[key];
+  jsonbinCache[key] = value;
+  try {
+    const res = await fetchWithTimeout(JSONBIN_URL, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_CONFIG.masterKey },
+      body: JSON.stringify(jsonbinCache)
+    }, 8000);
+    if (!res.ok) throw new Error('bad status ' + res.status);
+    ACTIVE_MODE = 'jsonbin';
+    return true;
+  } catch (e) { jsonbinCache[key] = prev; return false; }
+}
+
 /* kvdb.io - simple public REST key/value store, no account or API key needed.
    The "bucket" name below acts like a shared secret: anyone who knows this exact
    name can read/write this data, so it's kept long and specific to this project. */
 const KVDB_BUCKET = 'rostampour-parswater-cmm-8f2m4k1q';
 const KVDB_BASE = 'https://kvdb.io/' + KVDB_BUCKET + '/';
 let kvdbUnavailable = false;
-function fetchWithTimeout(url, opts, ms) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms || 6000);
-  return fetch(url, Object.assign({}, opts, { signal: controller.signal })).finally(() => clearTimeout(timer));
-}
 async function kvdbGet(key) {
   if (kvdbUnavailable) return undefined;
   try {
@@ -1034,6 +1092,8 @@ async function storageGet(key) {
       return snap.exists() ? snap.val() : null;
     } catch (e) { /* fall through to other backends */ }
   }
+  const jb = await jsonbinGet(key);
+  if (jb !== undefined) return jb;
   const kv = await kvdbGet(key);
   if (kv !== undefined) return kv;
   if (HAS_CLOUD_STORAGE) {
@@ -1046,6 +1106,8 @@ async function storageSet(key, value) {
   if (HAS_FIREBASE) {
     try { await firebaseDB.ref(key).set(value); return true; } catch (e) { /* fall through */ }
   }
+  const jbOk = await jsonbinSet(key, value);
+  if (jbOk) return true;
   const ok = await kvdbSet(key, value);
   if (ok) return true;
   if (HAS_CLOUD_STORAGE) {
@@ -1056,8 +1118,8 @@ async function storageSet(key, value) {
 }
 
 /* Keep all connected browsers in sync with the latest shared data.
-   Firebase gets instant push updates; kvdb/cloud modes are kept fresh via polling
-   every 15 seconds (no push support on a plain REST key/value store). */
+   Firebase gets instant push updates; jsonbin/kvdb/cloud modes are kept fresh
+   via polling every 15 seconds (no push support on a plain REST key/value store). */
 const LIVE_SYNC_MAP = {
   'v3-equipment-list': { prop: 'equipment', empty: [], after: () => { renderEquipmentTable(); refreshNavCounts(); renderDashboard(); } },
   'v3-pm-list': { prop: 'pm', empty: [], after: () => { renderPmTable(); refreshNavCounts(); renderDashboard(); } },
@@ -1086,7 +1148,8 @@ function startPolling() {
   if (HAS_FIREBASE || pollingBound) return;
   pollingBound = true;
   setInterval(async () => {
-    if (!currentRole || (ACTIVE_MODE !== 'kvdb' && ACTIVE_MODE !== 'cloud')) return;
+    if (!currentRole || (ACTIVE_MODE !== 'kvdb' && ACTIVE_MODE !== 'cloud' && ACTIVE_MODE !== 'jsonbin')) return;
+    if (ACTIVE_MODE === 'jsonbin') jsonbinCache = null; // force a fresh read this cycle
     for (const [key, cfg] of Object.entries(LIVE_SYNC_MAP)) {
       try {
         const raw = await storageGet(key);
@@ -2617,7 +2680,7 @@ function currentView() {
   if (ACTIVE_MODE === 'firebase') {
     textEl.textContent = 'حافظه آنلاین مشترک واقعی (Firebase) - همه کاربران به‌روز';
     noticeEl.textContent = 'این سامانه به یک پایگاه‌داده آنلاین واقعی (Firebase) متصل است؛ هر کاربری با هر مرورگری از هر دستگاهی وارد شود، آخرین اطلاعات را می‌بیند و تغییرات به‌صورت زنده برای همه به‌روزرسانی می‌شود.';
-  } else if (ACTIVE_MODE === 'kvdb') {
+  } else if (ACTIVE_MODE === 'jsonbin' || ACTIVE_MODE === 'kvdb') {
     textEl.textContent = 'حافظه آنلاین مشترک - همه کاربران به‌روز (هر ۱۵ ثانیه)';
     noticeEl.textContent = 'این سامانه به یک حافظه آنلاین مشترک متصل است؛ هر کاربری با هر مرورگری از هر دستگاهی وارد شود، آخرین اطلاعات را می‌بیند و تغییرات هر ۱۵ ثانیه یک‌بار برای همه به‌روزرسانی می‌شود.';
   } else if (ACTIVE_MODE === 'cloud') {
