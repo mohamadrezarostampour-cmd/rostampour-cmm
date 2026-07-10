@@ -1,0 +1,17 @@
+{
+  "name": "Rostampour CMM SW",
+  "short_name": "Rostampour CMM",
+  "description": "سامانه جامع مدیریت نگهداری و تعمیرات ایستگاه توزیع آب پارس",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0a0f1c",
+  "theme_color": "#0a0f1c",
+  "dir": "rtl",
+  "lang": "fa",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
